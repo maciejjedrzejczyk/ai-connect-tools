@@ -1,63 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
+source "$(dirname "$0")/lib-lmstudio.sh"
 
-CONFIG="$HOME/.config/claude-lmstudio/config.json"
-LMSTUDIO_URL="${LMSTUDIO_URL:-http://127.0.0.1:1234}"
+CLAUDE_CONFIG="$HOME/.config/claude-lmstudio/config.json"
+mkdir -p "$(dirname "$CLAUDE_CONFIG")"
+[ -f "$CLAUDE_CONFIG" ] || echo '{}' > "$CLAUDE_CONFIG"
 
-mkdir -p "$(dirname "$CONFIG")"
-[ -f "$CONFIG" ] || echo '{}' > "$CONFIG"
+# ── Fetch, pick, reload
+model_ids=$(lms_fetch_models)
+last_model=$(jq -r '.last_model // empty' "$SHARED_CONFIG" 2>/dev/null || true)
+selected=$(lms_pick_model "$model_ids" "$last_model")
+lms_reload_model "$selected"
 
-# Fetch models from LM Studio
-models=$(curl -sf "$LMSTUDIO_URL/v1/models" 2>/dev/null) || {
-  echo "Error: Cannot reach LM Studio at $LMSTUDIO_URL" >&2; exit 1
-}
-model_ids=$(echo "$models" | jq -r '.data[].id' | sort)
-[ -z "$model_ids" ] && { echo "No models found in LM Studio." >&2; exit 1; }
-
-# Load last used model
-last_model=$(jq -r '.last_model // empty' "$CONFIG" 2>/dev/null || true)
-
-# Build menu
-items=()
-while IFS= read -r line; do items+=("$line"); done <<< "$model_ids"
-echo "Available LM Studio models:"
-echo ""
-default_idx=""
-for i in "${!items[@]}"; do
-  marker="  "
-  if [ "${items[$i]}" = "$last_model" ]; then
-    marker="* "
-    default_idx=$((i+1))
-  fi
-  printf "  %s%d) %s\n" "$marker" $((i+1)) "${items[$i]}"
-done
-echo ""
-[ -n "$last_model" ] && echo "  (* = last used)"
-
-prompt="Select model"
-[ -n "$default_idx" ] && prompt="$prompt [$default_idx]"
-printf "\n%s: " "$prompt"
-read -r choice
-
-# Handle default
-[ -z "$choice" ] && [ -n "$default_idx" ] && choice="$default_idx"
-[ -z "$choice" ] && { echo "No selection made." >&2; exit 1; }
-
-# Validate
-if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#items[@]}" ]; then
-  echo "Invalid selection." >&2; exit 1
-fi
-selected="${items[$((choice-1))]}"
-
-# Save config
-jq -n --arg model "$selected" --arg url "$LMSTUDIO_URL" \
-  '{last_model: $model, base_url: $url, updated_at: (now | todate)}' > "$CONFIG"
+# ── Save selection
+lms_save_last_model "$selected"
+profile=$(model_profile "$selected")
+jq -n --arg model "$selected" --arg url "$LMSTUDIO_URL" --argjson profile "$profile" \
+  '{last_model:$model, base_url:$url, model_profile:$profile, updated_at:(now|todate)}' > "$CLAUDE_CONFIG"
 
 echo ""
 echo "Launching Claude Code with: $selected"
+echo "  Profile: $profile"
 echo ""
 
-# Launch claude with LM Studio env
 export ANTHROPIC_BASE_URL="$LMSTUDIO_URL"
 export ANTHROPIC_AUTH_TOKEN="lmstudio"
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 exec claude --model "$selected" "$@"
